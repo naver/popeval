@@ -279,14 +279,7 @@ def process( gt_file, pred_file, dontcare_text):
         for idx, anno in enumerate(ground_truths):
             # NOTICE: modify below line to make this work on multivertex polygons
             tokens = anno.split(SPLIT_DELIMITER)
-
-            # temp
-            gt_text = tokens[0].split(' ')[-8]
-            # temp start
-
-            # should be recovery
-            # gt_text = tokens[1]
-            # should be recovery
+            gt_text = tokens[1]
 
             # NOTICE: modify below line to make this work on multivertex polygons
             gt_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
@@ -301,24 +294,13 @@ def process( gt_file, pred_file, dontcare_text):
         for idx, pred in enumerate(predictions):
             # NOTICE: modify below line to make this work on multivertex polygons
             tokens = pred.split(SPLIT_DELIMITER)
-
-            # temp
-            pred_text = tokens[0].split(' ')[-8]
-            # temp start
-
-            # should be recovery
-            # pred_text = tokens[1]
-            # shoule be recovery
+            pred_text = tokens[1]
 
             # NOTICE: modify below line to make this work on multivertex polygons
             pred_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
             pred_boxes.append(pred_box)
             pred_texts.append(pred_text)
         gt_boxes, gt_texts, pred_boxes, pred_texts = removeDoncareBox(gt_boxes, gt_texts, pred_boxes, pred_texts, dontcare_text)
-
-        # for more efficient batches of operations, do preprocess
-        #gt_boxes = [prep(gt_box) for gt_box in gt_boxes]
-        #pred_boxes = [prep(pred_box) for pred_box in pred_boxes]
 
         step1 = removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts)
         step2 = removeControversialBox(*step1)
@@ -364,12 +346,16 @@ def papagoEval(gt_files, pred_files, dontcare_text=None):
     # multi process
     with ProcessPoolExecutor(os.cpu_count()) as executer:
         for result in executer.map(process, gt_files, pred_files, [dontcare_text]*len(pred_files)):
-            precision , recall, removed_gt_char_count, pred_char_count, gt_char_count = result
-            total_removed_gt_char_count += removed_gt_char_count
-            total_pred_char_count += pred_char_count
-            total_gt_chars_count += gt_char_count
-            precision_list.append(precision)
-            recall_list.append(recall)
+            try:
+                precision , recall, removed_gt_char_count, pred_char_count, gt_char_count = result
+                total_removed_gt_char_count += removed_gt_char_count
+                total_pred_char_count += pred_char_count
+                total_gt_chars_count += gt_char_count
+                precision_list.append(precision)
+                recall_list.append(recall)
+            except Exception as e:
+                print(e)
+                print(traceback.format_exc())
 
 
     precision_for_char = _divide(float(total_removed_gt_char_count), float(total_pred_char_count))
