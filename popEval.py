@@ -16,7 +16,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 '''
-
 import sys
 import glob
 import os
@@ -28,7 +27,14 @@ import argparse
 import numpy as np
 from shapely.geometry import Point, Polygon, MultiPoint
 from shapely.strtree import STRtree
+from shapely.prepared import prep
 import traceback
+
+# for multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+
+
+
 
 py2 = (sys.version_info < (3, 0))
 if not py2:
@@ -36,8 +42,8 @@ if not py2:
 
 SPLIT_DELIMITER = '##::'
 
-# reorder vertices 
-def getPolygon(vertex_list): 
+# reorder vertices
+def getPolygon(vertex_list):
     polygon = MultiPoint(vertex_list).convex_hull
     return polygon
 
@@ -51,7 +57,7 @@ def _divide(a,b):
 
 def removeDoncareBox(gt_boxes, gt_texts, pred_boxes, pred_texts, doncare_text=None):
     if doncare_text == None:
-        return gt_boxes, gt_texts, pred_boxes, pred_texts 
+        return gt_boxes, gt_texts, pred_boxes, pred_texts
     else:
         pred_idx_removed_for_doncare_list = []
         gt_idx_removed_for_doncare_list = []
@@ -81,14 +87,13 @@ def removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts):
     new_pred_texts = list(pred_texts)
     new_gt_texts = list(gt_texts)
     new_gt_boxes = list(gt_boxes)
+    prep_pred_boxes = [prep(x) for x in  pred_boxes] # prep support more efficient intersect method
 
     gt_box_del_candidates = {}
     for idx in range(len(gt_boxes)):
         gt_box_del_candidates[idx] = []
 
-
-   
-    # shapely polygon query optimization 
+    # shapely polygon query optimization
     gt_idx_by_id = dict((id(gt_box), i) for i, gt_box in enumerate(gt_boxes))
     gt_tree = STRtree(gt_boxes)
     for pred_idx, pred_box in enumerate(pred_boxes):
@@ -96,23 +101,17 @@ def removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts):
         searched_indices = [gt_idx_by_id[id(gt_box)] for gt_box in searched_boxes]
         searched_texts = [new_gt_texts[gt_idx] for gt_idx in searched_indices]
         for gt_text, gt_idx in zip(searched_texts, searched_indices):
-            pred_text_set = set(new_pred_texts[pred_idx])
-            for gt_char in gt_text:
-                if gt_char in pred_text_set: # if any character in gt exists in prediction text, we put this to gt_box_del_candidates
-                    gt_box_del_candidates[gt_idx].append(pred_idx)
-                    break;
+            pred_box = prep_pred_boxes[pred_idx]
+            gt_box = gt_boxes[gt_idx]
+            if pred_box.intersects(gt_box): # because STRtree is narrow search, the intersection should be checked.
+                pred_text_set = set(new_pred_texts[pred_idx])
+                for gt_char in gt_text:
+                    if gt_char in pred_text_set: # if any character in gt exists in prediction text, we put this to gt_box_del_candidates
+                        gt_box_del_candidates[gt_idx].append(pred_idx)
+                        break;
+    gt_box_del_candidates = dict(gt_box_del_candidates)
 
-     # for gt_idx, gt_box in enumerate(gt_boxes):
-        # for pred_idx, pred_box in enumerate(pred_boxes):
-            # if gt_box.intersects(pred_box): 
-                # gt_text = new_gt_texts[gt_idx]
-                # for gt_char in gt_text:
-                    # if gt_char in new_pred_texts[pred_idx]: # if any character in gt exists in prediction text,
-                                                            # we put this to gt_box_del_candidates
-                        # gt_box_del_candidates[gt_idx].append(pred_idx)
-                        # break;
-
-    # filtering non-controversial ones among gt_box_del_candidates 
+    # filtering non-controversial ones among gt_box_del_candidates
     gt_idx_to_pred_idx_non_conv = {}
     for k in list(gt_box_del_candidates.keys()):
         if len(gt_box_del_candidates[k]) == 1:
@@ -138,7 +137,7 @@ def removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts):
     pred_index = gt_idx_to_pred_idx_non_conv[gt_idx]
     pred_text = new_pred_texts[pred_index]
     gt_text = new_gt_texts[gt_idx]
-    
+
     delete_gt_char_idxes = []
     for gt_char_idx, gt_char in enumerate(gt_text):
         # The reading direction is assumed to be from left to right.
@@ -201,7 +200,7 @@ def removeControversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts, gt_box_de
     gt_idx = keys[gt_box_origin_dists.index(min(gt_box_origin_dists))]
 
     ################################################
-    ## pred_candidates picking priority : 
+    ## pred_candidates picking priority :
     ## intersection area / gt_box area (bigger is earlier)
     ################################################
     pred_candidates = gt_idx_to_pred_idx_conv[gt_idx]
@@ -262,105 +261,115 @@ def removeControversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts, gt_box_de
     new_gt_boxes = [ c for idx, c in enumerate(new_gt_boxes) if idx not in delete_gt_idxes ]
 
     gt_boxes, gt_texts, pred_boxes, pred_texts, gt_box_del_candidates = removeNoncontroversialBox(new_gt_boxes, new_gt_texts, pred_boxes, new_pred_texts)
-    # tail recursion 
+    # tail recursion
     return removeControversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts, gt_box_del_candidates)
 
-@profile
+def process( gt_file, pred_file, dontcare_text):
+    filename = pred_file
+    try:
+        with io.open(gt_file, 'r', encoding='utf-8') as f:
+            gt_raw = f.read()
+        with io.open(pred_file, 'r', encoding='utf-8') as f:
+            pred_raw = f.read()
+
+        #parsing GT from raw text
+        ground_truths = [x for x in gt_raw.split("\n") if len(x) != 0]
+        gt_boxes = []
+        gt_texts = []
+        for idx, anno in enumerate(ground_truths):
+            # NOTICE: modify below line to make this work on multivertex polygons
+            tokens = anno.split(SPLIT_DELIMITER)
+
+            # temp
+            gt_text = tokens[0].split(' ')[-8]
+            # temp start
+
+            # should be recovery
+            # gt_text = tokens[1]
+            # should be recovery
+
+            # NOTICE: modify below line to make this work on multivertex polygons
+            gt_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
+            if len(gt_text) != 0:
+                gt_boxes.append(gt_box)
+                gt_texts.append(gt_text)
+
+        #parsing prediction from raw text
+        predictions = [x for x in pred_raw.split("\n") if len(x) != 0]
+        pred_boxes = []
+        pred_texts = []
+        for idx, pred in enumerate(predictions):
+            # NOTICE: modify below line to make this work on multivertex polygons
+            tokens = pred.split(SPLIT_DELIMITER)
+
+            # temp
+            pred_text = tokens[0].split(' ')[-8]
+            # temp start
+
+            # should be recovery
+            # pred_text = tokens[1]
+            # shoule be recovery
+
+            # NOTICE: modify below line to make this work on multivertex polygons
+            pred_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
+            pred_boxes.append(pred_box)
+            pred_texts.append(pred_text)
+        gt_boxes, gt_texts, pred_boxes, pred_texts = removeDoncareBox(gt_boxes, gt_texts, pred_boxes, pred_texts, dontcare_text)
+
+        # for more efficient batches of operations, do preprocess
+        #gt_boxes = [prep(gt_box) for gt_box in gt_boxes]
+        #pred_boxes = [prep(pred_box) for pred_box in pred_boxes]
+
+        step1 = removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts)
+        step2 = removeControversialBox(*step1)
+
+        unremoved_gt_boxes = step2[0]
+        unremoved_gt_chars = step2[1]
+        remain_pred_texts = step2[3]
+        gt_char_count = len("".join(gt_texts))
+        unremoved_gt_char_count = len("".join(unremoved_gt_chars))
+        removed_gt_char_count = gt_char_count - unremoved_gt_char_count
+        pred_char_count = len("".join(pred_texts))
+
+        # Precision : removed character(among prediction) number / predicted character number
+        #             removed_gt_char_count  / pred_char_count
+        # Recall    : removed character(among prediction) number / ground truth character number
+        #             removed_gt_char_count  / len(gt_boxes)
+        if gt_char_count == 0:
+            recall = float(1)
+            precision = float(0) if pred_char_count > 0 else float(1)
+        else:
+            precision = _divide(float(removed_gt_char_count), float(pred_char_count))
+            recall = _divide((removed_gt_char_count), float(gt_char_count))
+
+
+        return precision , recall, removed_gt_char_count, pred_char_count, gt_char_count
+    except Exception as e:
+        print(filename, e)
+        print(traceback.format_exc())
+
+
+
+#@profile
 def papagoEval(gt_files, pred_files, dontcare_text=None):
     removed_gt_char_count = 0
     filename_to_f_score = {}
-
     precision_list = []
     recall_list = []
 
     total_removed_gt_char_count= 0
     total_pred_char_count = 0
     total_gt_chars_count = 0
-    for i in range(len(pred_files)):
-        if i % 100 == 0:
-            print("%d / %d" % (i, len(pred_files)))
-        filename = pred_files[i]
-        pred_file = pred_files[i]
-        gt_file = gt_files[i]
-        try:
-            with io.open(gt_file, 'r', encoding='utf-8') as f:
-                gt_raw = f.read()
-            with io.open(pred_file, 'r', encoding='utf-8') as f:
-                pred_raw = f.read()
 
-            #parsing GT from raw text
-            ground_truths = [x for x in gt_raw.split("\n") if len(x) != 0]
-            gt_boxes = []
-            gt_texts = []
-            for idx, anno in enumerate(ground_truths):
-                # NOTICE: modify below line to make this work on multivertex polygons
-                tokens = anno.split(SPLIT_DELIMITER)
-                
-                # temp
-                gt_text = tokens[0].split(' ')[-8]
-                # temp start
-
-                # should be recovery
-                # gt_text = tokens[1]
-                # should be recovery
-
-                # NOTICE: modify below line to make this work on multivertex polygons
-                gt_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
-                if len(gt_text) != 0:
-                    gt_boxes.append(gt_box)
-                    gt_texts.append(gt_text)
-
-            #parsing prediction from raw text
-            predictions = [x for x in pred_raw.split("\n") if len(x) != 0]
-            pred_boxes = []
-            pred_texts = []
-            for idx, pred in enumerate(predictions):
-                # NOTICE: modify below line to make this work on multivertex polygons
-                tokens = pred.split(SPLIT_DELIMITER)
-
-                # temp
-                pred_text = tokens[0].split(' ')[-8]
-                # temp start
-
-                # should be recovery
-                # pred_text = tokens[1]
-                # shoule be recovery
-
-                # NOTICE: modify below line to make this work on multivertex polygons
-                pred_box = getPolygon(chunker(tokens[0].split(" ")[:8], 2))
-                pred_boxes.append(pred_box)
-                pred_texts.append(pred_text)
-            gt_boxes, gt_texts, pred_boxes, pred_texts = removeDoncareBox(gt_boxes, gt_texts, pred_boxes, pred_texts, dontcare_text) 
-            step1 = removeNoncontroversialBox(gt_boxes, gt_texts, pred_boxes, pred_texts)
-            step2 = removeControversialBox(*step1)
-            
-            unremoved_gt_boxes = step2[0]
-            unremoved_gt_chars = step2[1]
-            remain_pred_texts = step2[3]
-            gt_char_count = len("".join(gt_texts)) 
-            unremoved_gt_char_count = len("".join(unremoved_gt_chars))
-            removed_gt_char_count = gt_char_count - unremoved_gt_char_count
-            pred_char_count = len("".join(pred_texts))
-
+    # multi process
+    with ProcessPoolExecutor(os.cpu_count()) as executer:
+        for result in executer.map(process, gt_files, pred_files, [dontcare_text]*len(pred_files)):
+            precision , recall, removed_gt_char_count, pred_char_count, gt_char_count = result
             total_removed_gt_char_count += removed_gt_char_count
             total_pred_char_count += pred_char_count
             total_gt_chars_count += gt_char_count
-            # Precision : removed character(among prediction) number / predicted character number
-            #             removed_gt_char_count  / pred_char_count
-            # Recall    : removed character(among prediction) number / ground truth character number
-            #             removed_gt_char_count  / len(gt_boxes)
-            if gt_char_count == 0:
-                recall = float(1)
-                precision = float(0) if pred_char_count > 0 else float(1)
-            else:
-                precision = _divide(float(removed_gt_char_count), float(pred_char_count))
-                recall = _divide((removed_gt_char_count), float(gt_char_count))
-
             precision_list.append(precision)
             recall_list.append(recall)
-        except Exception as e:
-            print(filename, e)
-            print(traceback.format_exc())
 
 
     precision_for_char = _divide(float(total_removed_gt_char_count), float(total_pred_char_count))
@@ -376,7 +385,7 @@ def papagoEval(gt_files, pred_files, dontcare_text=None):
 def make_pair(GTs, Ds):
     if len(GTs)==0 or len(Ds)==0:
         return [], []
-    
+
     def fname(x):
         _, fn = os.path.split(x)
         return fn
@@ -420,7 +429,7 @@ if __name__ == "__main__":
         print("Caution: GT_files' len(%d) and D_files' len(%d) are different."%(len(GT_files), len(D_files)))
         GT_files, D_files = make_pair(GT_files, D_files)
         print("We will evaluate on %d files"%(len(GT_files)))
-    
+
     pr, re, pref = papagoEval(GT_files, D_files, dontcare_text="###")
     print("precision, recall, H:")
     print("%0.1f, %0.1f, %0.1f"%(100.*pr, 100.*re, 100.*pref))
